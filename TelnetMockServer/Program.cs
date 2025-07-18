@@ -45,8 +45,30 @@ namespace TelnetMockServer
                             return $"Sum is: {n1 + n2}";
                         return "Invalid numbers.";
                     },
-                    ["exit"] = cmd => "Goodbye!"
+                    ["exit"] = cmd => "Goodbye!",
+                    
                 }
+            };
+
+            config.Commands["#OUTPUT"] = cmd =>
+            {
+                // Expected format: #OUTPUT,<num1>,<num2>
+                // Example: #OUTPUT,225,1
+
+                var parts = cmd.Split(',', StringSplitOptions.RemoveEmptyEntries);
+                if (parts.Length == 3 && parts[0].Equals("#OUTPUT", StringComparison.OrdinalIgnoreCase))
+                {
+                    // Validate the two numbers
+                    if (int.TryParse(parts[1], out int num1) && int.TryParse(parts[2], out int num2))
+                    {
+                        return $"?OUTPUT,{num1},{num2}";
+                    }
+                    else
+                    {
+                        return "Invalid number format.";
+                    }
+                }
+                return "Invalid command format. Use #OUTPUT,<num1>,<num2>";
             };
 
             var server = new Telnet.TelnetMockServer(23, config);

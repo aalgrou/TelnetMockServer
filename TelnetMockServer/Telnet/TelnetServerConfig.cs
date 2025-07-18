@@ -19,7 +19,6 @@ public class TelnetServerConfig
     public int MaxLoginAttempts { get; set; } = 3;
     public int IdleTimeoutSeconds { get; set; } = 60;
 
-    // Prompt shown before every command input line, can be fixed or dynamic function
     public Func<string>? PromptFunc { get; set; }
     public string Prompt { get; set; } = "> ";
 

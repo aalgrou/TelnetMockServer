@@ -57,6 +57,7 @@ public class TelnetMockServer
         {
             var stream = client.GetStream();
 
+            // Send welcome before login
             if (config.WelcomeBeforeLoginFunc != null)
                 await SendAsync(stream, config.WelcomeBeforeLoginFunc() + "\r\n");
             else if (!string.IsNullOrEmpty(config.WelcomeBeforeLogin))
@@ -120,6 +121,7 @@ public class TelnetMockServer
                     await SendAsync(stream, config.WelcomeAfterLogin + "\r\n");
             }
 
+            // Command loop
             while (client.Connected)
             {
                 string promptToSend = config.PromptFunc != null ? config.PromptFunc() : config.Prompt;
@@ -135,16 +137,34 @@ public class TelnetMockServer
                 if (string.IsNullOrWhiteSpace(command))
                     continue;
 
-                string commandKey = command.Split(' ')[0];
-
-                if (commandKey.Equals("exit", StringComparison.OrdinalIgnoreCase) ||
-                    commandKey.Equals("quit", StringComparison.OrdinalIgnoreCase))
+                // Exit command handling
+                if (command.Equals("exit", StringComparison.OrdinalIgnoreCase) ||
+                    command.Equals("quit", StringComparison.OrdinalIgnoreCase))
                 {
                     await SendAsync(stream, "Goodbye!\r\n");
                     break;
                 }
 
-                if (config.Commands.TryGetValue(commandKey, out var handler))
+                // Improved command matching: exact first, then prefix match
+                Func<string, string>? handler = null;
+
+                if (config.Commands.TryGetValue(command, out handler))
+                {
+                    // exact match
+                }
+                else
+                {
+                    foreach (var key in config.Commands.Keys)
+                    {
+                        if (command.StartsWith(key, StringComparison.OrdinalIgnoreCase))
+                        {
+                            handler = config.Commands[key];
+                            break;
+                        }
+                    }
+                }
+
+                if (handler != null)
                 {
                     string response = handler(command);
                     await SendAsync(stream, response + "\r\n");
@@ -205,8 +225,7 @@ public class TelnetMockServer
                 buffer.Add(b);
                 if (!maskInput)
                 {
-                    // no echo to avoid doubling input chars
-                    // client normally handles echo
+                    // No echo to avoid double letters; clients handle echo
                 }
             }
         }
