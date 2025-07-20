@@ -8,19 +8,21 @@ namespace TelnetMockServer
         {
             var config = new TelnetServerConfig
             {
+                AllowOnlySingleConnection = true,
                 WelcomeBeforeLogin = "=== Welcome! Please login ===",
-                WelcomeAfterLoginFunc = () => $"Login time: {DateTime.Now}",
-                PromptFunc = () => $"mockserver@{DateTime.Now:HH:mm}> ",
-                AuthenticationMode = AuthMode.UsernameAndPassword,
-                LoginPrompt = "Username:",
+                //WelcomeAfterLoginFunc = () => $"Login time: {DateTime.Now}",
+                PromptFunc = () => $"{Environment.NewLine}QNET> ",
+                AuthenticationMode = AuthMode.UsernameOnly,
+                LoginPrompt = "login:",
                 PasswordPrompt = "Password:",
-                SuccessLoginMessage = "You are now logged in!",
+                SuccessLoginMessage = "connection established!",
                 FailLoginMessage = "Incorrect credentials, please try again.",
                 TooManyAttemptsMessage = "Maximum login attempts reached. Disconnecting.",
                 InvalidCommandMessage = "Unknown command, type 'help' for list.",
                 IdleTimeoutMessage = "Disconnected due to inactivity.",
                 MaxLoginAttempts = 3,
                 IdleTimeoutSeconds = 120,
+                
                 Credentials = new Dictionary<string, string>
                 {
                     ["user"] = "pass",

@@ -9,6 +9,9 @@ public class TelnetMockServer
     private readonly TcpListener listener;
     private readonly int port;
     private readonly TelnetServerConfig config;
+    private TcpClient? currentClient;
+    private NetworkStream? currentStream;
+    private readonly SemaphoreSlim clientSemaphore = new SemaphoreSlim(1, 1);
 
     public TelnetMockServer(int port, TelnetServerConfig config)
     {
@@ -47,140 +50,231 @@ public class TelnetMockServer
         while (!cancellationToken.IsCancellationRequested)
         {
             var client = await listener.AcceptTcpClientAsync();
-            _ = HandleClientAsync(client); // fire and forget
+
+            await clientSemaphore.WaitAsync();
+            try
+            {
+                if (config.AllowOnlySingleConnection && currentClient != null)
+                {
+                    var oldClient = currentClient;
+                    var oldStream = currentStream;
+
+                    // Don't await inside the lock - process the old client after releasing the semaphore
+                    _ = Task.Run(async () =>
+                    {
+                        try
+                        {
+                            if (oldStream != null)
+                            {
+                                await SendAsync(oldStream, "\r\nConnection closed by server (new connection requested).\r\n");
+                            }
+                            oldClient?.Close();
+                        }
+                        catch { /* Ignore any errors during close */ }
+                    });
+                }
+
+                currentClient = client;
+                currentStream = client.GetStream();
+            }
+            finally
+            {
+                clientSemaphore.Release();
+            }
+
+            _ = HandleClientAsync(client).ContinueWith(async t =>
+            {
+                await clientSemaphore.WaitAsync();
+                try
+                {
+                    if (currentClient == client)
+                    {
+                        currentClient = null;
+                        currentStream = null;
+                    }
+                }
+                finally
+                {
+                    clientSemaphore.Release();
+                }
+            });
         }
     }
 
     private async Task HandleClientAsync(TcpClient client)
     {
-        using (client)
+        NetworkStream stream;
+        await clientSemaphore.WaitAsync();
+        try
         {
-            var stream = client.GetStream();
+            stream = currentStream!;
+        }
+        finally
+        {
+            clientSemaphore.Release();
+        }
 
-            // Send welcome before login
-            if (config.WelcomeBeforeLoginFunc != null)
-                await SendAsync(stream, config.WelcomeBeforeLoginFunc() + "\r\n");
-            else if (!string.IsNullOrEmpty(config.WelcomeBeforeLogin))
-                await SendAsync(stream, config.WelcomeBeforeLogin + "\r\n");
-
-            int loginAttempts = 0;
-            bool authenticated = false;
-            string? username = null;
-
-            if (config.AuthenticationMode != AuthMode.None)
+        try
+        {
+            using (client)
             {
-                while (!authenticated && loginAttempts < config.MaxLoginAttempts)
-                {
-                    await SendAsync(stream, config.LoginPrompt + " ");
-                    username = await ReadLineAsync(stream, config.IdleTimeoutSeconds);
-                    if (username == null) break;
+                // Send welcome before login
+                if (config.WelcomeBeforeLoginFunc != null)
+                    await SendAsync(stream, config.WelcomeBeforeLoginFunc() + "\r\n");
+                else if (!string.IsNullOrEmpty(config.WelcomeBeforeLogin))
+                    await SendAsync(stream, config.WelcomeBeforeLogin + "\r\n");
 
-                    if (config.AuthenticationMode == AuthMode.UsernameAndPassword)
+                int loginAttempts = 0;
+                bool authenticated = false;
+                string? username = null;
+
+                if (config.AuthenticationMode != AuthMode.None)
+                {
+                    while (!authenticated && loginAttempts < config.MaxLoginAttempts)
                     {
-                        await SendAsync(stream, config.PasswordPrompt + " ");
-                        string? password = await ReadLineAsync(stream, config.IdleTimeoutSeconds, maskInput: true);
-                        if (password == null) break;
+                        await SendAsync(stream, config.LoginPrompt + " ");
+                        username = await ReadLineAsync(stream, config.IdleTimeoutSeconds);
+                        if (username == null) break;
 
-                        if (config.Credentials.TryGetValue(username, out string? correctPassword) && correctPassword == password)
+                        if (config.AuthenticationMode == AuthMode.UsernameAndPassword)
                         {
-                            authenticated = true;
-                            break;
+                            await SendAsync(stream, config.PasswordPrompt + " ");
+                            string? password = await ReadLineAsync(stream, config.IdleTimeoutSeconds, maskInput: true);
+                            if (password == null) break;
+
+                            if (config.Credentials.TryGetValue(username, out string? correctPassword) && correctPassword == password)
+                            {
+                                authenticated = true;
+                                break;
+                            }
                         }
+                        else if (config.AuthenticationMode == AuthMode.UsernameOnly)
+                        {
+                            if (config.Credentials.ContainsKey(username))
+                            {
+                                authenticated = true;
+                                break;
+                            }
+                        }
+
+                        loginAttempts++;
+                        await SendAsync(stream, config.FailLoginMessage + "\r\n");
                     }
-                    else if (config.AuthenticationMode == AuthMode.UsernameOnly)
+
+                    if (!authenticated)
                     {
-                        if (config.Credentials.ContainsKey(username))
-                        {
-                            authenticated = true;
-                            break;
-                        }
+                        await SendAsync(stream, config.TooManyAttemptsMessage + "\r\n");
+                        return;
                     }
 
-                    loginAttempts++;
-                    await SendAsync(stream, config.FailLoginMessage + "\r\n");
-                }
+                    await SendAsync(stream, config.SuccessLoginMessage + "\r\n");
 
-                if (!authenticated)
-                {
-                    await SendAsync(stream, config.TooManyAttemptsMessage + "\r\n");
-                    return;
-                }
-
-                await SendAsync(stream, config.SuccessLoginMessage + "\r\n");
-
-                if (config.WelcomeAfterLoginFunc != null)
-                    await SendAsync(stream, config.WelcomeAfterLoginFunc() + "\r\n");
-                else if (!string.IsNullOrEmpty(config.WelcomeAfterLogin))
-                    await SendAsync(stream, config.WelcomeAfterLogin + "\r\n");
-            }
-            else
-            {
-                if (config.WelcomeAfterLoginFunc != null)
-                    await SendAsync(stream, config.WelcomeAfterLoginFunc() + "\r\n");
-                else if (!string.IsNullOrEmpty(config.WelcomeAfterLogin))
-                    await SendAsync(stream, config.WelcomeAfterLogin + "\r\n");
-            }
-
-            // Command loop
-            while (client.Connected)
-            {
-                string promptToSend = config.PromptFunc != null ? config.PromptFunc() : config.Prompt;
-                await SendAsync(stream, promptToSend);
-
-                string? command = await ReadLineAsync(stream, config.IdleTimeoutSeconds);
-                if (command == null)
-                {
-                    await SendAsync(stream, "\r\n" + config.IdleTimeoutMessage + "\r\n");
-                    break;
-                }
-
-                if (string.IsNullOrWhiteSpace(command))
-                    continue;
-
-                // Exit command handling
-                if (command.Equals("exit", StringComparison.OrdinalIgnoreCase) ||
-                    command.Equals("quit", StringComparison.OrdinalIgnoreCase))
-                {
-                    await SendAsync(stream, "Goodbye!\r\n");
-                    break;
-                }
-
-                // Improved command matching: exact first, then prefix match
-                Func<string, string>? handler = null;
-
-                if (config.Commands.TryGetValue(command, out handler))
-                {
-                    // exact match
+                    if (config.WelcomeAfterLoginFunc != null)
+                        await SendAsync(stream, config.WelcomeAfterLoginFunc() + "\r\n");
+                    else if (!string.IsNullOrEmpty(config.WelcomeAfterLogin))
+                        await SendAsync(stream, config.WelcomeAfterLogin + "\r\n");
                 }
                 else
                 {
-                    foreach (var key in config.Commands.Keys)
-                    {
-                        if (command.StartsWith(key, StringComparison.OrdinalIgnoreCase))
-                        {
-                            handler = config.Commands[key];
-                            break;
-                        }
-                    }
+                    if (config.WelcomeAfterLoginFunc != null)
+                        await SendAsync(stream, config.WelcomeAfterLoginFunc() + "\r\n");
+                    else if (!string.IsNullOrEmpty(config.WelcomeAfterLogin))
+                        await SendAsync(stream, config.WelcomeAfterLogin + "\r\n");
                 }
 
-                if (handler != null)
+                // Command loop
+                while (client.Connected)
                 {
-                    string response = handler(command);
-                    await SendAsync(stream, response + "\r\n");
+                    string promptToSend = config.PromptFunc != null ? config.PromptFunc() : config.Prompt;
+                    await SendAsync(stream, promptToSend);
+
+                    string? command = await ReadLineAsync(stream, config.IdleTimeoutSeconds);
+                    if (command == null)
+                    {
+                        await SendAsync(stream, "\r\n" + config.IdleTimeoutMessage + "\r\n");
+                        break;
+                    }
+
+                    if (string.IsNullOrWhiteSpace(command))
+                        continue;
+
+                    // Check for BYE command (from Ctrl+])
+                    if (command.Equals("BYE", StringComparison.OrdinalIgnoreCase))
+                    {
+                        await SendAsync(stream, "Connection terminated by client.\r\n");
+                        break;
+                    }
+
+                    // Exit command handling
+                    if (command.Equals("exit", StringComparison.OrdinalIgnoreCase) ||
+                        command.Equals("quit", StringComparison.OrdinalIgnoreCase))
+                    {
+                        await SendAsync(stream, "Goodbye!\r\n");
+                        break;
+                    }
+
+                    // Improved command matching: exact first, then prefix match
+                    Func<string, string>? handler = null;
+
+                    if (config.Commands.TryGetValue(command, out handler))
+                    {
+                        // exact match
+                    }
+                    else
+                    {
+                        foreach (var key in config.Commands.Keys)
+                        {
+                            if (command.StartsWith(key, StringComparison.OrdinalIgnoreCase))
+                            {
+                                handler = config.Commands[key];
+                                break;
+                            }
+                        }
+                    }
+
+                    if (handler != null)
+                    {
+                        string response = handler(command);
+                        await SendAsync(stream, response + "\r\n");
+                    }
+                    else
+                    {
+                        await SendAsync(stream, config.InvalidCommandMessage + "\r\n");
+                    }
                 }
-                else
+            }
+        }
+        finally
+        {
+            await clientSemaphore.WaitAsync();
+            try
+            {
+                if (currentClient == client)
                 {
-                    await SendAsync(stream, config.InvalidCommandMessage + "\r\n");
+                    currentClient = null;
+                    currentStream = null;
                 }
+            }
+            finally
+            {
+                clientSemaphore.Release();
             }
         }
     }
 
-    private async Task SendAsync(NetworkStream stream, string message)
+    private async Task SendAsync(NetworkStream? stream, string message)
     {
-        byte[] data = Encoding.ASCII.GetBytes(message);
-        await stream.WriteAsync(data, 0, data.Length);
+        if (stream == null) return;
+
+        try
+        {
+            byte[] data = Encoding.ASCII.GetBytes(message);
+            await stream.WriteAsync(data, 0, data.Length);
+        }
+        catch
+        {
+            // Connection was probably closed
+        }
     }
 
     private async Task<string?> ReadLineAsync(NetworkStream stream, int timeoutSeconds, bool maskInput = false)
@@ -210,23 +304,31 @@ public class TelnetMockServer
 
             var b = tempBuffer[0];
 
-            if (b == 13)
+            // Check for Telnet IAC (0xFF) followed by DO (0xFD) - which is Ctrl+]
+            if (b == 0xFF)
+            {
+                // Read the next byte to confirm it's the DO command
+                bytesRead = await stream.ReadAsync(tempBuffer, 0, bufferSize);
+                if (bytesRead > 0 && tempBuffer[0] == 0xFD)
+                {
+                    return "BYE"; // Special command to terminate the connection
+                }
+                continue;
+            }
+
+            if (b == 13) // CR
             {
                 if (stream.DataAvailable)
-                    await stream.ReadAsync(tempBuffer, 0, 1);
+                    await stream.ReadAsync(tempBuffer, 0, 1); // Read LF if available
                 break;
             }
-            else if (b == 10)
+            else if (b == 10) // LF
             {
                 break;
             }
             else
             {
                 buffer.Add(b);
-                if (!maskInput)
-                {
-                    // No echo to avoid double letters; clients handle echo
-                }
             }
         }
 

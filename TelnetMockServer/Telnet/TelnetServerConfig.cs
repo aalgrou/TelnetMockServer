@@ -5,6 +5,7 @@ public class TelnetServerConfig
     public Func<string>? WelcomeBeforeLoginFunc { get; set; }
     public string? WelcomeBeforeLogin { get; set; }
 
+    public bool AllowOnlySingleConnection { get; set; } = false;
     public Func<string>? WelcomeAfterLoginFunc { get; set; }
     public string? WelcomeAfterLogin { get; set; }
 
